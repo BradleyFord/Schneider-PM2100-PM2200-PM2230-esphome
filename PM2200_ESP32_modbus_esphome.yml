@@ -1,232 +1,948 @@
+substitutions:
+  name: "pm2230-energy-monitor"
+  friendly_name: "PM2230 Energy Monitor"
+
 esphome:
-  name: schneider-pm2230
-  friendly_name: PM2230
+  name: ${name}
+  friendly_name: ${friendly_name}
 
 esp32:
   board: esp32dev
   framework:
-    type: arduino
+    type: esp-idf
+    advanced:
+      minimum_chip_revision: "3.0"
 
-globals:
-  # Enable variable restore from RTC memory (ESP8266 only)
-  # Daily export base variable will not survive a power cycle, only reboots.
-  - id: daily_export_base
-    type: float
-    restore_value: yes
-    initial_value: '-1'
-
-# Enable logging
-logger:
-
-# Enable Home Assistant API
 api:
-  encryption:
-    key: "cqv0WUXhhp2eEJc9ERLBRjh8mM+m6HdeVZTHkYUDbKY="
-
 ota:
-
+  - platform: esphome
 
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
-
-  # Enable fallback hotspot (captive portal) in case wifi connection fails
   ap:
-    ssid: "Esphome-Web-67Ea04"
-    password: "wYH893Mzb9CV"
+    ssid: PM2230 Energy M Fallback Hotspot
+    password: t3qG8GanlOMa
 
 captive_portal:
 
 web_server:
+  version: 3
+  
+logger:
+  level: INFO
+  baud_rate: 0  # Disables UART0 logging to prevent GPIO pin conflicts
 
-
-
-time:
-  - platform: homeassistant
-    id: esptime
-  - platform: sntp
-    on_time:
-      # Reset all four daily import counters at midnight
-      # This will also force the command_result id to be updated
-      # Validation check could be performed on command_result sensor
-      # 0 = valid operation (reset all partial registers - ok)
-      # 3000 = invalid operation (reset all partial registers - nok) )
-      - seconds: 59
-        minutes: 59
-        hours: 23
-        days_of_week: MON-SUN
-        then:
-          - component.update: PM2230_daily
-
-binary_sensor:
-  - platform: status
-    name: "Energy Meter Status"
-    id: system_status
-
+# ===========================================================================
+# RS-485 SERIAL UART & MODBUS BUS
+# Schneider PM2000 factory defaults: 19200 baud, 8 data bits, Even parity, 1 stop bit
+# ===========================================================================
 uart:
-  id: mod_bus
-  rx_pin: 17
-  tx_pin: 16
+  id: modbus_uart
+  rx_pin: GPIO17
+  tx_pin: GPIO16
   baud_rate: 19200
+  data_bits: 8
   parity: EVEN
   stop_bits: 1
-  # Optional debug parameter if rx/tx uart hex data is needed for debugging  
-  #debug:
 
 modbus:
-  id: modbus1
+  id: modbus_bus
+  uart_id: modbus_uart
+  turnaround_time: 35ms  # Centralized inter-frame silent interval
 
+# ===========================================================================
+# MODBUS CONTROLLER TIERS (Governs Polling Rates)
+# ===========================================================================
 modbus_controller:
-  - id: PM2230
-    address: 0x1
-    modbus_id: modbus1
-    # Update all, but Total Active, energy sensors every minute
+  # Tier 1: Fast Operational Measurements (5s)
+  - id: pm2230_fast
+    address: 1
+    modbus_id: modbus_bus
+    setup_priority: -10
+    update_interval: 5s
+    offline_skip_updates: 5
+
+  # Tier 2: Energy Accumulators & Demand (20s)
+  - id: pm2230_energy
+    address: 1
+    modbus_id: modbus_bus
+    setup_priority: -10
+    update_interval: 20s
+    offline_skip_updates: 5
+
+  # Tier 3: Harmonics, Unbalance & Extremes (60s)
+  - id: pm2230_quality
+    address: 1
+    modbus_id: modbus_bus
+    setup_priority: -10
     update_interval: 60s
-    
-  - id: PM2230_freq
-    address: 0x1
-    modbus_id: modbus1
-    # Update Total Active Energy sensor frequently (10 seconds interval)
-    update_interval: 10s  
-  
-  - id: PM2230_daily
-    address: 0x1
-    modbus_id: modbus1
-    # No interval sensor update !
-    # Only custom_command sensor is using this id (once daily at midnight)
-    update_interval: never  
-    
+    offline_skip_updates: 5
+
+  # Tier 4: Hardware Config & Static Metadata (300s)
+  - id: pm2230_static
+    address: 1
+    modbus_id: modbus_bus
+    setup_priority: -10
+    update_interval: 300s
+    offline_skip_updates: 5
+
+# ===========================================================================
+# TIME & NATIVE MODBUS_CLIENT RTC SYNCHRONIZATION
+# ===========================================================================
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: "Asia/Bangkok"
+    on_time:
+      - seconds: 0
+        minutes: 0
+        hours: 3
+        then:
+          - script.execute: sync_pm2230_clock
+
+script:
+  - id: sync_pm2230_clock
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: 'return id(sntp_time).now().is_valid();'
+          then:
+            - modbus_client.write_multiple_registers:
+                modbus_id: modbus_bus
+                address: 1
+                start_address: 1835
+                values: !lambda |-
+                  auto t = id(sntp_time).now();
+                  uint16_t reg_ym = ((uint16_t(t.year - 2000) & 0xFF) << 8) | (uint16_t(t.month) & 0xFF);
+                  uint16_t reg_dh = ((uint16_t(t.day_of_month) & 0xFF) << 8) | (uint16_t(t.hour) & 0xFF);
+                  uint16_t reg_ms = ((uint16_t(t.minute) & 0xFF) << 8) | (uint16_t(t.second) & 0xFF);
+                  ESP_LOGI("PM2230", "Dispatched RTC sync: 20%02u-%02u-%02u %02u:%02u:%02u",
+                           (t.year - 2000), t.month, t.day_of_month, t.hour, t.minute, t.second);
+                  return {reg_ym, reg_dh, reg_ms};
+
+# ===========================================================================
+# COMMAND CONTROLS & RESETS (Native modbus_client.write_multiple_registers)
+# Writes [0000 (Password), Command Code] to Reg 5248 via FC16
+# ===========================================================================
+button:
+  - platform: template
+    name: "PM2230 Reset Peak Demand"
+    id: pm2230_btn_reset_peak_demand
+    icon: "mdi:chart-line-variant"
+    entity_category: diagnostic
+    on_press:
+      - modbus_client.write_multiple_registers:
+          modbus_id: modbus_bus
+          address: 1
+          start_address: 5248
+          values: [0, 1001]
+
+  - platform: template
+    name: "PM2230 Reset Min-Max Extremes"
+    id: pm2230_btn_reset_minmax
+    icon: "mdi:history"
+    entity_category: diagnostic
+    on_press:
+      - modbus_client.write_multiple_registers:
+          modbus_id: modbus_bus
+          address: 1
+          start_address: 5248
+          values: [0, 1002]
+
+  - platform: template
+    name: "PM2230 Reset Cumulative Energy"
+    id: pm2230_btn_reset_energy
+    icon: "mdi:gauge-empty"
+    entity_category: diagnostic
+    on_press:
+      - modbus_client.write_multiple_registers:
+          modbus_id: modbus_bus
+          address: 1
+          start_address: 5248
+          values: [0, 1003]
+
+  - platform: template
+    name: "PM2230 Sync Clock Now"
+    id: pm2230_btn_sync_clock
+    icon: "mdi:clock-sync"
+    entity_category: diagnostic
+    on_press:
+      - script.execute: sync_pm2230_clock
+
+# ===========================================================================
+# BINARY SENSORS: DIAGNOSTICS & ALARMS
+# ===========================================================================
+binary_sensor:
+  - platform: status
+    name: "PM2230 Node API Status"
+    id: pm2230_node_status
+    entity_category: diagnostic
+
+  - platform: template
+    name: "PM2230 Phase Loss Anomaly"
+    id: pm2230_phase_loss_anomaly
+    device_class: problem
+    entity_category: diagnostic
+    lambda: |-
+      if (!id(pm2230_voltage_v1_n).has_state() || 
+          !id(pm2230_voltage_v2_n).has_state() || 
+          !id(pm2230_voltage_v3_n).has_state()) return false;
+
+      float v1 = id(pm2230_voltage_v1_n).state;
+      float v2 = id(pm2230_voltage_v2_n).state;
+      float v3 = id(pm2230_voltage_v3_n).state;
+      if (isnan(v1) || isnan(v2) || isnan(v3)) return false;
+
+      bool v1_dead = (v1 < 50.0f);
+      bool v2_dead = (v2 < 50.0f);
+      bool v3_dead = (v3 < 50.0f);
+      bool any_live = (v1 > 180.0f || v2 > 180.0f || v3 > 180.0f);
+
+      return any_live && (v1_dead || v2_dead || v3_dead);
+
+  # Active Alarm Register 1 (Register 6099 0-based): Bitmasked from pm2230_energy poll
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_energy
+    name: "Alarm Over Voltage"
+    id: pm2230_alarm_ov
+    address: 6099
+    register_type: holding
+    bitmask: 0x0001
+    device_class: problem
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_energy
+    name: "Alarm Under Voltage"
+    id: pm2230_alarm_uv
+    address: 6099
+    register_type: holding
+    bitmask: 0x0002
+    device_class: problem
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_energy
+    name: "Alarm Over Current"
+    id: pm2230_alarm_oc
+    address: 6099
+    register_type: holding
+    bitmask: 0x0004
+    device_class: problem
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_energy
+    name: "Alarm Voltage Unbalance"
+    id: pm2230_alarm_v_unbal
+    address: 6099
+    register_type: holding
+    bitmask: 0x0008
+    device_class: problem
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_energy
+    name: "Alarm Phase Reversal"
+    id: pm2230_alarm_phase_rev
+    address: 6099
+    register_type: holding
+    bitmask: 0x0010
+    device_class: problem
+
+# ===========================================================================
+# SENSORS
+# ===========================================================================
 sensor:
+  # -------------------------------------------------------------------------
+  # DERIVED BIDIRECTIONAL SOLAR / GRID INSTANTANEOUS POWER (Template: 5s)
+  # -------------------------------------------------------------------------
+  - platform: template
+    name: "Grid Instantaneous Import Power"
+    id: pm2230_import_power
+    unit_of_measurement: "kW"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 3
+    update_interval: 5s
+    lambda: |-
+      if (!id(pm2230_active_power_total).has_state()) return NAN;
+      float p = id(pm2230_active_power_total).state;
+      if (isnan(p)) return NAN;
+      return (p > 0.0f) ? p : 0.0f;
+
+  - platform: template
+    name: "Grid Instantaneous Export Power"
+    id: pm2230_export_power
+    unit_of_measurement: "kW"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 3
+    update_interval: 5s
+    lambda: |-
+      if (!id(pm2230_active_power_total).has_state()) return NAN;
+      float p = id(pm2230_active_power_total).state;
+      if (isnan(p)) return NAN;
+      return (p < 0.0f) ? (-p) : 0.0f;
+
+  # -------------------------------------------------------------------------
+  # TIER 1: FAST OPERATIONAL MEASUREMENTS (Polled by pm2230_fast: 5s)
+  # -------------------------------------------------------------------------
   - platform: modbus_controller
-    modbus_controller_id: PM2230
-    name: "L1 Active Power"
-    id: power_l1
+    modbus_controller_id: pm2230_fast
+    name: "Phase A Current"
+    id: pm2230_current_a
+    address: 2999
     register_type: holding
-    address: 3053
-    unit_of_measurement: "Wh"
-    device_class: energy
     value_type: FP32
-    filters:
-      - multiply: 1000
-    accuracy_decimals: 0
-    
-  - platform: modbus_controller
-    modbus_controller_id: PM2230
-    name: "L2 Active Power"
-    id: power_l2
-    register_type: holding
-    address: 3055
-    unit_of_measurement: "Wh"
-    device_class: energy
-    value_type: FP32
-    filters:
-      - multiply: 1000
-    accuracy_decimals: 0
-    
-  - platform: modbus_controller
-    modbus_controller_id: PM2230
-    name: "L3 Active Power"
-    id: power_l3
-    register_type: holding
-    address: 3057
-    unit_of_measurement: "Wh"
-    device_class: energy
-    value_type: FP32
-    filters:
-      - multiply: 1000
-    accuracy_decimals: 0
-    
-  - platform: modbus_controller
-    modbus_controller_id: PM2230
-    name: "Total Active Power"
-    id: power_total
-    register_type: holding
-    address: 3059
-    unit_of_measurement: "Wh"
-    device_class: energy
-    value_type: FP32
-    filters:
-      - multiply: 1000
-    accuracy_decimals: 0
-   
-  - platform: modbus_controller
-    modbus_controller_id: PM2230
-    name: "Power Factor"
-    id: power_factor
-    register_type: holding
-    address: 3083
-    value_type: FP32
+    unit_of_measurement: "A"
     accuracy_decimals: 2
-    ## Possible float values from: -2 to +1
-  
+    device_class: current
+    state_class: measurement
+
   - platform: modbus_controller
-    modbus_controller_id: PM2230
-    name: "Voltage avg. All Phases"
-    id: voltage_avg
+    modbus_controller_id: pm2230_fast
+    name: "Phase B Current"
+    id: pm2230_current_b
+    address: 3001
     register_type: holding
-    address: 3035
-    icon: mdi:sine-wave
+    value_type: FP32
+    unit_of_measurement: "A"
+    accuracy_decimals: 2
+    device_class: current
+    state_class: measurement
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_fast
+    name: "Phase C Current"
+    id: pm2230_current_c
+    address: 3003
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "A"
+    accuracy_decimals: 2
+    device_class: current
+    state_class: measurement
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_fast
+    name: "Neutral Current"
+    id: pm2230_current_n
+    address: 3005
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "A"
+    accuracy_decimals: 2
+    device_class: current
+    state_class: measurement
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_fast
+    name: "3-Phase Avg Current"
+    id: pm2230_current_avg
+    address: 3009
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "A"
+    accuracy_decimals: 2
+    device_class: current
+    state_class: measurement
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_fast
+    name: "Voltage U1-2"
+    id: pm2230_voltage_u12
+    address: 3019
+    register_type: holding
+    value_type: FP32
     unit_of_measurement: "V"
-    value_type: FP32
-    accuracy_decimals: 0
-    
+    accuracy_decimals: 1
+    device_class: voltage
+    state_class: measurement
+
   - platform: modbus_controller
-    modbus_controller_id: PM2230
-    name: "Frequency"
-    id: frequency
+    modbus_controller_id: pm2230_fast
+    name: "Voltage U2-3"
+    id: pm2230_voltage_u23
+    address: 3021
     register_type: holding
+    value_type: FP32
+    unit_of_measurement: "V"
+    accuracy_decimals: 1
+    device_class: voltage
+    state_class: measurement
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_fast
+    name: "Voltage U3-1"
+    id: pm2230_voltage_u31
+    address: 3023
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "V"
+    accuracy_decimals: 1
+    device_class: voltage
+    state_class: measurement
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_fast
+    name: "Voltage L-L Avg"
+    id: pm2230_voltage_ll_avg
+    address: 3025
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "V"
+    accuracy_decimals: 1
+    device_class: voltage
+    state_class: measurement
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_fast
+    name: "Voltage V1-N"
+    id: pm2230_voltage_v1_n
+    address: 3027
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "V"
+    accuracy_decimals: 1
+    device_class: voltage
+    state_class: measurement
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_fast
+    name: "Voltage V2-N"
+    id: pm2230_voltage_v2_n
+    address: 3029
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "V"
+    accuracy_decimals: 1
+    device_class: voltage
+    state_class: measurement
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_fast
+    name: "Voltage V3-N"
+    id: pm2230_voltage_v3_n
+    address: 3031
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "V"
+    accuracy_decimals: 1
+    device_class: voltage
+    state_class: measurement
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_fast
+    name: "Voltage L-N Avg"
+    id: pm2230_voltage_ln_avg
+    address: 3035
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "V"
+    accuracy_decimals: 1
+    device_class: voltage
+    state_class: measurement
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_fast
+    name: "Active Power Phase A"
+    id: pm2230_active_power_a
+    address: 3053
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "kW"
+    accuracy_decimals: 3
+    device_class: power
+    state_class: measurement
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_fast
+    name: "Active Power Phase B"
+    id: pm2230_active_power_b
+    address: 3055
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "kW"
+    accuracy_decimals: 3
+    device_class: power
+    state_class: measurement
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_fast
+    name: "Active Power Phase C"
+    id: pm2230_active_power_c
+    address: 3057
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "kW"
+    accuracy_decimals: 3
+    device_class: power
+    state_class: measurement
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_fast
+    name: "Total Active Power"
+    id: pm2230_active_power_total
+    address: 3059
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "kW"
+    accuracy_decimals: 3
+    device_class: power
+    state_class: measurement
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_fast
+    name: "Total Reactive Power"
+    id: pm2230_reactive_power_total
+    address: 3067
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "kvar"
+    accuracy_decimals: 3
+    state_class: measurement
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_fast
+    name: "Total Apparent Power"
+    id: pm2230_apparent_power_total
+    address: 3075
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "kVA"
+    accuracy_decimals: 3
+    device_class: apparent_power
+    state_class: measurement
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_fast
+    name: "Total True Power Factor"
+    id: pm2230_true_power_factor
+    address: 3083
+    register_type: holding
+    value_type: FP32
+    accuracy_decimals: 3
+    device_class: power_factor
+    state_class: measurement
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_fast
+    name: "Total Displacement Power Factor"
+    id: pm2230_displacement_pf
+    address: 3091
+    register_type: holding
+    value_type: FP32
+    accuracy_decimals: 3
+    device_class: power_factor
+    state_class: measurement
+    entity_category: diagnostic
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_fast
+    name: "Grid Frequency"
+    id: pm2230_frequency
     address: 3109
-    icon: mdi:sine-wave
-    unit_of_measurement: "Hz"
-    value_type: FP32
-    accuracy_decimals: 0
-
-  - platform: total_daily_energy
-    name: "PM2230 Daily Consumption"
-    power_id: power_total
-    filters:
-        # Multiplication factor from W to kW is 0.001
-      - multiply: 0.001
-    unit_of_measurement: kWh
-    device_class: energy
-
-  - platform: modbus_controller
-    modbus_controller_id: PM2230
-    name: "Number of Power Failures"
-    id: "NoPowerFailures"
-    register_type: read
-    address: 1829
-    icon: mdi:sail-boat-sink
-    value_type: U_WORD
-    accuracy_decimals: 0
-
-  - platform: modbus_controller
-    modbus_controller_id: PM2230
-    name: "Duration of last Power Failure"
-    id: "DurationofLastPowerFailure"
     register_type: holding
-    address: 1834
-    icon: mdi:sail-boat-sink
+    value_type: FP32
+    unit_of_measurement: "Hz"
+    accuracy_decimals: 2
+    device_class: frequency
+    state_class: measurement
+
+  # -------------------------------------------------------------------------
+  # TIER 2: ENERGY, DEMAND & TIMERS (Polled by pm2230_energy: 20s)
+  # -------------------------------------------------------------------------
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_energy
+    name: "Present Active Demand"
+    id: pm2230_present_active_demand
+    address: 3141
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "kW"
+    accuracy_decimals: 3
+    device_class: power
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_energy
+    name: "Last Closed Active Demand"
+    id: pm2230_last_active_demand
+    address: 3147
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "kW"
+    accuracy_decimals: 3
+    device_class: power
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_energy
+    name: "Active Energy Delivered (Import)"
+    id: pm2230_active_energy_delivered
+    address: 3203
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 2
+    device_class: energy
+    state_class: total_increasing
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_energy
+    name: "Active Energy Received (Export)"
+    id: pm2230_active_energy_received
+    address: 3205
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 2
+    device_class: energy
+    state_class: total_increasing
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_energy
+    name: "Reactive Energy Delivered"
+    id: pm2230_reactive_energy_delivered
+    address: 3207
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "kvarh"
+    accuracy_decimals: 2
+    state_class: total_increasing
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_energy
+    name: "Apparent Energy Received"
+    id: pm2230_apparent_energy_received
+    address: 3213
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "kVAh"
+    accuracy_decimals: 2
+    state_class: total_increasing
+    entity_category: diagnostic
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_energy
+    name: "Net Active Energy"
+    id: pm2230_net_active_energy
+    address: 3221
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 2
+    device_class: energy
+    state_class: total
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_energy
+    name: "TOU Tariff 1 Energy"
+    id: pm2230_tou_tariff_1
+    address: 3253
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 2
+    device_class: energy
+    state_class: total_increasing
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_energy
+    name: "TOU Tariff 2 Energy"
+    id: pm2230_tou_tariff_2
+    address: 3255
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 2
+    device_class: energy
+    state_class: total_increasing
+        
+  # -------------------------------------------------------------------------
+  # TIER 3: HARMONICS & EXTREMES (Polled by pm2230_quality: 60s)
+  # -------------------------------------------------------------------------
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_quality
+    name: "Current THD Phase A"
+    id: pm2230_thd_i_a
+    address: 2129
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "%"
+    accuracy_decimals: 2
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_quality
+    name: "Current THD Phase B"
+    id: pm2230_thd_i_b
+    address: 2131
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "%"
+    accuracy_decimals: 2
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_quality
+    name: "Current THD Phase C"
+    id: pm2230_thd_i_c
+    address: 2133
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "%"
+    accuracy_decimals: 2
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_quality
+    name: "Voltage THD Phase A-N"
+    id: pm2230_thd_v_a
+    address: 2143                  # Corrected from 2137 (U12) to 2143 (V1-N)
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "%"
+    accuracy_decimals: 2
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_quality
+    name: "Voltage THD Phase B-N"
+    id: pm2230_thd_v_b
+    address: 2145
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "%"
+    accuracy_decimals: 2
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_quality
+    name: "Voltage THD Phase C-N"
+    id: pm2230_thd_v_c
+    address: 2147
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "%"
+    accuracy_decimals: 2
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_quality
+    name: "Phase A Current 3rd Harmonic"
+    id: pm2230_i_a_h3
+    address: 2149
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "%"
+    accuracy_decimals: 2
+    entity_category: diagnostic
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_quality
+    name: "Phase A Current 5th Harmonic"
+    id: pm2230_i_a_h5
+    address: 2151
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "%"
+    accuracy_decimals: 2
+    entity_category: diagnostic
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_quality
+    name: "Phase A Current 7th Harmonic"
+    id: pm2230_i_a_h7
+    address: 2153
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "%"
+    accuracy_decimals: 2
+    entity_category: diagnostic
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_quality
+    name: "Peak Active Demand"
+    id: pm2230_peak_active_demand
+    address: 3153
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "kW"
+    accuracy_decimals: 2
+    device_class: power
+    entity_category: diagnostic
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_quality
+    name: "Min Recorded Voltage L-N Avg"
+    id: pm2230_min_v_ln
+    address: 3287
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "V"
+    accuracy_decimals: 1
+    device_class: voltage
+    entity_category: diagnostic
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_quality
+    name: "Max Recorded Voltage L-N Avg"
+    id: pm2230_max_v_ln
+    address: 3307
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "V"
+    accuracy_decimals: 1
+    device_class: voltage
+    entity_category: diagnostic
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_quality
+    name: "Min Recorded Power Factor"
+    id: pm2230_min_pf
+    address: 3347
+    register_type: holding
+    value_type: FP32
+    accuracy_decimals: 3
+    device_class: power_factor
+    entity_category: diagnostic
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_quality
+    name: "Min Recorded Frequency"
+    id: pm2230_min_freq
+    address: 3373
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "Hz"
+    accuracy_decimals: 2
+    device_class: frequency
+    entity_category: diagnostic
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_quality
+    name: "Max Recorded Frequency"
+    id: pm2230_max_freq
+    address: 3375
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "Hz"
+    accuracy_decimals: 2
+    device_class: frequency
+    entity_category: diagnostic
+
+  # -------------------------------------------------------------------------
+  # TIER 4: HARDWARE RATIOS & STATIC METADATA (Polled by pm2230_static: 300s)
+  # -------------------------------------------------------------------------
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_static
+    name: "Device Serial Number"
+    id: pm2230_serial_number
+    address: 129
+    register_type: holding
     value_type: U_DWORD
     accuracy_decimals: 0
+    entity_category: diagnostic
 
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_static
+    name: "Hardware Revision"
+    id: pm2230_hw_revision
+    address: 1638
+    register_type: holding
+    value_type: U_WORD
+    accuracy_decimals: 0
+    entity_category: diagnostic
 
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_static
+    name: "Configured CT Primary"
+    id: pm2230_ct_primary
+    address: 2003
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "A"
+    accuracy_decimals: 0
+    entity_category: diagnostic
 
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_static
+    name: "Configured CT Secondary"
+    id: pm2230_ct_secondary
+    address: 2005
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "A"
+    accuracy_decimals: 0
+    entity_category: diagnostic
 
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_static
+    name: "Configured PT Primary"
+    id: pm2230_pt_primary
+    address: 2007
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "V"
+    accuracy_decimals: 0
+    entity_category: diagnostic
 
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_static
+    name: "Configured PT Secondary"
+    id: pm2230_pt_secondary
+    address: 2009
+    register_type: holding
+    value_type: FP32
+    unit_of_measurement: "V"
+    accuracy_decimals: 0
+    entity_category: diagnostic
+
+# ===========================================================================
+# TEXT SENSORS: DIAGNOSTICS & SYSTEM STRINGS
+# ===========================================================================
 text_sensor:
-  - platform: modbus_controller
-    modbus_controller_id: PM2230
-    name: "Date/Time of Last Power Failure"
-    id: "DateTimeLastPowerFailure"
-    register_type: holding
-    address: 1830
-    icon: mdi:sail-boat-sink
+  - platform: template
+    name: "PM2230 Modbus Link Health"
+    id: pm2230_modbus_link_health
+    icon: "mdi:check-network"
+    entity_category: diagnostic
+    update_interval: 5s
+    lambda: |-
+      if (id(pm2230_voltage_ln_avg).has_state() && !isnan(id(pm2230_voltage_ln_avg).state)) {
+        return std::string("Online / Polling Active");
+      } else {
+        return std::string("Communication Fault / Offline");
+      }
 
   - platform: modbus_controller
-    modbus_controller_id: PM2230
+    modbus_controller_id: pm2230_static
     name: "Firmware Version"
-    id: "FirmwareVersion"
+    id: pm2230_firmware_version
+    address: 1636
+    response_size: 4
     register_type: holding
-    address: 1637
-    icon: mdi:calendar-range
+    entity_category: diagnostic
+    lambda: |-
+      if (data.size() < 4) return std::string("Unknown");
+      uint32_t val = (uint32_t(data[0]) << 24) | (uint32_t(data[1]) << 16) | (uint32_t(data[2]) << 8) | uint32_t(data[3]);
+      uint8_t major = (val >> 16) & 0xFF;
+      uint8_t minor = (val >> 8) & 0xFF;
+      uint8_t rev = val & 0xFF;
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%u.%u.%u", major, minor, rev);
+      return std::string(buf);
+
+  - platform: modbus_controller
+    modbus_controller_id: pm2230_static
+    name: "System Wiring Configuration"
+    id: pm2230_wiring_system
+    address: 1999
+    response_size: 2
+    register_type: holding
+    entity_category: diagnostic
+    lambda: |-
+      if (data.size() < 2) return std::string("Unknown");
+      uint16_t raw = (uint16_t(data[0]) << 8) | uint16_t(data[1]);
+      uint16_t type = raw & 0x7FFF;  // Strips bit 15 (Direct Connection flag)
+      std::string mode = (raw & 0x8000) ? " (Direct Connect)" : " (PT Connected)";
+      switch (type) {
+        case 0: return std::string("3PH4W Wye") + mode;
+        case 1: return std::string("3PH3W Delta") + mode;
+        case 2: return std::string("1PH2W L-N") + mode;
+        case 3: return std::string("1PH3W") + mode;
+        case 4: return std::string("3PH3W Open Delta") + mode;
+        default: return std::string("Configuration Code: " + std::to_string(raw));
+      }
