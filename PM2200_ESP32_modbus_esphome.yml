@@ -852,7 +852,7 @@ sensor:
     id: pm2230_ct_primary
     address: 2003
     register_type: holding
-    value_type: U_WORD
+    value_type: FP32
     unit_of_measurement: "A"
     accuracy_decimals: 0
     entity_category: diagnostic
@@ -863,7 +863,7 @@ sensor:
     id: pm2230_ct_secondary
     address: 2005
     register_type: holding
-    value_type: U_WORD
+    value_type: FP32
     unit_of_measurement: "A"
     accuracy_decimals: 0
     entity_category: diagnostic
